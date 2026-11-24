@@ -1,0 +1,4 @@
+reproduction/output/*/checkpoint.pt
+reproduction/output/*/state_*
+reproduction/output/*/params_*
+__pycache__/
