@@ -63,11 +63,18 @@ def _step(s, de, sub=20):
     return s
 
 
-def loading_unloading_test(eps_max):
-    """Load to eps_max at constant rate, then unload at the same rate until the stress reaches zero."""
+def loading_unloading_test(eps_max, loop=0.):
+    """Load to eps_max at constant rate, then unload at the same rate until the stress reaches zero.
+    loop > 0: at 40 % of eps_max insert a small unloading-reloading loop of strain amplitude `loop`.
+    Returns rates, stress and the (start, end) step indices of the loop (or None)."""
     sg = np.sign(eps_max)
     n_load = int(round(abs(eps_max) / (RATE * H)))
-    rates = [sg * RATE] * n_load
+    if loop > 0:
+        n1 = int(round(0.4 * n_load)); nl = int(round(loop / (RATE * H)))
+        rates = [sg * RATE] * n1 + [-sg * RATE] * nl + [sg * RATE] * (nl + n_load - n1)
+        loop_idx = (n1, n1 + 2 * nl)
+    else:
+        rates, loop_idx = [sg * RATE] * n_load, None
     sig = list(reference_response(rates))
     while True:
         s_new = _step(sig[-1], -sg * RATE * H)
@@ -75,7 +82,7 @@ def loading_unloading_test(eps_max):
         sig.append(s_new)
         if np.sign(s_new) != sg:
             break
-    return np.array(rates), np.array(sig)
+    return np.array(rates), np.array(sig), loop_idx
 
 
 def random_cyclic_path(rng, n_rev=6, eps_lim=0.006):
@@ -160,24 +167,35 @@ def main():
     ap.add_argument('--noise', type=float, default=0., help='noise amplitude delta in percent')
     ap.add_argument('--epochs', type=int, default=3000)
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--w-diss', type=float, default=1., help='weight of the dissipation-inequality loss')
+    ap.add_argument('--diss-form', choices=['sq', 'l1'], default='sq',
+                    help="sq: mean((relu(-d)/max|d|)^2) as in the NICE repository; l1: mean(relu(-d))/max|d|")
+    ap.add_argument('--loop', type=float, default=0., help='strain amplitude of a small unloading-reloading loop (0 = none)')
+    ap.add_argument('--loop-samples', type=int, default=10, help='extra stress samples inside the loop')
+    ap.add_argument('--tag', default=None)
     args = ap.parse_args()
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
-    tag = f'noise{args.noise:g}'
+    tag = args.tag or f'noise{args.noise:g}'
     os.makedirs(OUT, exist_ok=True)
 
     # ---- data: 24 loading-unloading tests (12 amplitudes, tension and compression) ----
     amps = np.linspace(0.0005, 0.006, 12)
-    tests = [loading_unloading_test(s * a) for a in amps for s in (1, -1)]
+    tests = [loading_unloading_test(s * a, args.loop) for a in amps for s in (1, -1)]
     idx = rng.permutation(len(tests))
     n_tr, n_va = 14, 5
     i_tr, i_va, i_te = idx[:n_tr], idx[n_tr:n_tr + n_va], idx[n_tr + n_va:]
     R, S, L = pad([t[0] for t in tests], [t[1] for t in tests])
 
     # sparse sampling: N_SAMPLES stress values per test (+ initial state)
-    samp = np.zeros((N_SAMPLES + 1, len(tests)), dtype=int)
+    n_extra = args.loop_samples if args.loop > 0 else 0
+    samp = np.zeros((N_SAMPLES + 1 + n_extra, len(tests)), dtype=int)
     for i, n in enumerate(L):
-        samp[:, i] = np.round(np.linspace(0, n, N_SAMPLES + 1)).astype(int)
+        base = np.round(np.linspace(0, n, N_SAMPLES + 1)).astype(int)
+        if n_extra:
+            a, b = tests[i][2]
+            base = np.r_[base, np.round(np.linspace(a, b, n_extra + 2)[1:-1]).astype(int)]
+        samp[:, i] = base
     S_meas = np.take_along_axis(S, samp, 0)
     if args.noise > 0:
         noise = np.mean(np.abs(S_meas[1:])) * rng.normal(0, args.noise / 100, S_meas[1:].shape)
@@ -205,7 +223,8 @@ def main():
         l_r0 = mse(model.stress(y0)[mask, 0] / prm_s, Sm[0, mask] / prm_s)
         valid = (torch.arange(Rt.shape[0])[:, None] < torch.tensor(L[trv])[None, :])
         dd = diss[..., 0][valid[:, :] & mask[None, :]]
-        l_d = torch.mean((torch.relu(-dd) / (dd.abs().max().detach() + 1e-12)) ** 2)
+        nd = torch.relu(-dd) / (dd.abs().max().detach() + 1e-12)
+        l_d = torch.mean(nd ** 2) if args.diss_form == 'sq' else torch.mean(nd)
         return l_sig, l_r0, l_d
 
     best, best_state, hist, t0 = np.inf, None, [], time.time()
@@ -213,13 +232,13 @@ def main():
         opt.zero_grad()
         l_sig, l_r0, l_d = losses(mask_tr)
         l2 = sum((p ** 2).sum() for n, p in model.named_parameters() if 'weight' in n)
-        loss = l_sig + l_r0 + l_d + 1e-5 * l2
+        loss = l_sig + l_r0 + args.w_diss * l_d + 1e-5 * l2
         loss.backward(); opt.step()
         if sched.get_last_lr()[0] > 1e-4:
             sched.step()
         if ep % 25 == 0 or ep == 1:
             v_sig, v_r0, v_d = losses(~mask_tr)
-            v = (v_sig + v_r0 + v_d).item()
+            v = (v_sig + v_r0 + args.w_diss * v_d).item()
             hist.append((ep, l_sig.item(), v))
             if v < best:
                 best, best_state = v, {k: x.detach().clone() for k, x in model.state_dict().items()}
@@ -238,7 +257,7 @@ def main():
         e = [np.sqrt(np.mean((pred[:n + 1, i] - ref[:n + 1, i]) ** 2)) for i, n in enumerate(lengths)]
         return float(np.mean(e) / S_REF)
 
-    res = {'noise_percent': args.noise, 'n_train_tests': n_tr, 'n_val_tests': n_va, 'samples_per_test': N_SAMPLES,
+    res = {'tag': tag, 'w_diss': args.w_diss, 'diss_form': args.diss_form, 'loop': args.loop, 'noise_percent': args.noise, 'n_train_tests': n_tr, 'n_val_tests': n_va, 'samples_per_test': N_SAMPLES,
            'data_used': 'stress at 40 times per loading-unloading test + imposed strain; no elastic/plastic strain, energy or dissipation',
            'epochs': args.epochs, 'train_time_s': round(time.time() - t0, 1)}
     _, s_te, _ = predict(R[:, i_te], S[0, i_te])
