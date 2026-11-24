@@ -41,3 +41,42 @@ Błąd σ = RMSE / S. Wykres: `output/summary.png`.
 - **Rp0.2 i σ graniczne** – dobrze (różnica ~2 % i < 1 %).
 - Praktycznie: E warto wyznaczyć niezależnie (np. pomiar ultradźwiękowy, mała pętla odciążenia w zakresie sprężystym)
   albo wzmocnić karę za ujemną dyssypację.
+
+## Identyfikacja E: silniejsza II zasada (krok 1) i mała pętla odciążenia (krok 2)
+
+Dlaczego E jest słabo określone: dla tego materiału przeskalowanie εᵉ → c·εᵉ, u → c·u daje **dokładnie te same
+naprężenia** dla dowolnej historii obciążenia. Jedyną informacją, która wymusza c = 1, jest II zasada
+(d = σ(ε̇ − ε̇ᵉ) ≥ 0): przy σ → 0 obciążanie wymaga c ≤ 1, a odciążanie c ≥ 1. Naruszenie jest ∝ σ, więc kara
+w postaci z repozytorium NICE, mean((relu(−d)/max|d|)²), jest zbyt słaba.
+
+```bash
+# krok 1: kara L1 za ujemną dyssypację
+python examples_1d/nice_1d_hypoplastic.py --noise 2 --diss-form l1 --w-diss 10 --tag pen_l1_w10
+# krok 2: + mała pętla odciążenie–obciążenie (0.05 %) w 40 % obciążenia, 10 dodatkowych pomiarów w pętli
+python examples_1d/nice_1d_hypoplastic.py --noise 2 --loop 0.0005 --diss-form l1 --w-diss 10 --tag loop_l1_w10
+python examples_1d/compare_variants.py
+```
+
+Wszystkie warianty: szum 2 %, 5000 epok.
+
+| wariant (szum 2 %) | E (mediana) | εᵉ: skala vs prawda | błąd σ cykle | błąd σ obc.–odc. | Rp0.2 | ujemna d |
+|---|---|---|---|---|---|---|
+| bazowy (kara sq, w=1) | 95,048 (-52%) | 1.83× | 0.68% | 0.86% | 140.5 | 6.4% |
+| kara L1 w=1 | 170,052 (-15%) | 1.24× | 0.79% | 0.83% | 138.4 | 2.0% |
+| kara L1 w=10 | 184,420 (-8%) | 1.13× | 1.44% | 1.46% | 138.3 | 0.7% |
+| pętla + kara sq | 108,043 (-46%) | 1.80× | 0.94% | 0.65% | 141.2 | 6.4% |
+| pętla + L1 w=1 | 191,993 (-4%) | 1.14× | 0.26% | 0.41% | 138.5 | 1.2% |
+| pętla + L1 w=10 | 197,331 (-1%) | 1.04× | 0.44% | 0.38% | 138.5 | 0.1% |
+| referencja | 200 000 | 1.00× | – | – | 138.3 | 0 % |
+
+Za silne kary (sq w = 1000, L1 w = 100) psują trening (błąd σ na cyklach 64 % i 43 %) – wyniki w `output/`.
+
+Wnioski:
+- **Sama pętla nie pomaga** (E 95 000 → 108 000) – zgodnie z teorią, bo symetria skali jest dokładna dla każdej
+  ścieżki obciążenia.
+- **Sama kara L1** poprawia E do −8 % (w = 10), kosztem nieco większego błędu σ.
+- **Pętla + kara L1 działają razem najlepiej**: E = 197 300 (−1 %), skala εᵉ 1.04×, błąd σ na niewidzianych
+  cyklach 0.44 %, ujemna dyssypacja w 0.1 % punktów. Pętla daje dodatkowe stany z odciążaniem przy niezerowym σ,
+  w których II zasada jest „aktywna”, a kara L1 sprawia, że te stany realnie wpływają na trening.
+
+Wykres: `output/compare_variants.png`.
